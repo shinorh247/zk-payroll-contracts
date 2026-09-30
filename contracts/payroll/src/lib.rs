@@ -5717,6 +5717,43 @@ impl Payroll {
         payroll_events::emit_compliance_hold_released(&e, hold_id, admin);
     }
 
+    /// Authorize the release of an active compliance hold. Returns an actionable
+    /// error when the release is not permitted; it never exposes hold payloads
+    /// that reference salary or employee data.
+    pub fn try_release_compliance_hold(
+        e: Env,
+        admin: Address,
+        hold_id: u64,
+        run_id: u64,
+    ) -> Result<(), StateError> {
+        admin.require_auth();
+
+        let key = DataKey::ComplianceHold(hold_id);
+        let hold: ComplianceHold = e.storage().persistent().get(&key).ok_or(StateError::ComplianceHoldNotFound)?;
+
+        if !hold.is_active {
+            return Err(StateError::ComplianceHoldNotActive);
+        }
+
+        // A hold may only be released while its payroll run is still actionable
+        // (draft, validating, or proof pending). Terminal or already-finalized
+        // runs must not be re-opened through a hold release.
+        match Self::get_payroll_run_state(e.clone(), run_id) {
+            PayrollRunState::Draft
+            | PayrollRunState::Validating
+            | PayrollRunState::ProofPending => {}
+            _ => return Err(StateError::ComplianceHoldOnTerminalState),
+        }
+
+        let mut hold_guard = hold;
+        hold_guard.is_active = false;
+        e.storage().persistent().set(&key, &hold_guard);
+
+        payroll_events::emit_compliance_hold_released(&e, hold_id, admin);
+
+        Ok(())
+    }
+
     /// Check if a compliance hold is currently active (#333).
     pub fn is_compliance_hold_active(e: Env, hold_id: u64) -> bool {
         e.storage()
@@ -5726,11 +5763,49 @@ impl Payroll {
             .unwrap_or(false)
     }
 
-    /// Get compliance hold details by hold ID (#333).
-    pub fn get_compliance_hold(e: Env, hold_id: u64) -> Option<ComplianceHold> {
-        e.storage()
+    /// Require that no active compliance hold blocks the relevant payroll run,
+    /// failing with an actionable `StateError` before any payroll work begins.
+    pub fn require_no_active_compliance_hold(e: &Env, run_id: u64) -> Result<(), StateError> {
+        let hold_key = DataKey::ComplianceHoldCounter;
+        let hold_counter = e
+            .storage()
             .persistent()
-            .get(&DataKey::ComplianceHold(hold_id))
+            .get(&hold_key)
+            .unwrap_or(0);
+
+        for id in 1..=hold_counter {
+            let hold = e
+                .storage()
+                .persistent()
+                .get::<_, ComplianceHold>(&DataKey::ComplianceHold(id));
+            let Some(hold) = hold else {
+                continue;
+            };
+            if !hold.is_active {
+                continue;
+            }
+
+            match hold.scope {
+                ComplianceHoldScope::Batch => {
+                    if hold.hold_id == run_id {
+                        return Err(StateError::ComplianceHoldActive);
+                    }
+                }
+                ComplianceHoldScope::Employer => {
+                    // Employer holds block every run for the held employer.
+                    if hold.target == e.current_contract_address() {
+                        return Err(StateError::ComplianceHoldActive);
+                    }
+                }
+                ComplianceHoldScope::Employee => {
+                    // Employee holds are scoped to an individual; the batch
+                    // path does not expose employee identifiers to this gate.
+                    continue;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     // ????????????????????????????????????????????????????????????????????????????

@@ -204,6 +204,13 @@ pub enum StateError {
     EmployeeIneligible = 507,
     /// The compliance hold blocks this payroll operation.
     ComplianceHoldActive = 508,
+    /// The compliance hold does not exist (no hold record for this hold ID).
+    ComplianceHoldNotFound = 509,
+    /// The compliance hold exists but is not active (already released).
+    ComplianceHoldNotActive = 510,
+    /// The compliance hold is active, but the payroll run it guards is on a
+    /// terminal or already-finalized state and cannot be re-opened.
+    ComplianceHoldOnTerminalState = 511,
 }
 
 /// Replay Protection and Idempotency Errors (600-699)
